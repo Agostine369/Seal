@@ -1,0 +1,216 @@
+name: QuickDL TikTok 46.4.3 Inspection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download exact TikTokModCloud APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input report
+
+          curl -fL --retry 4 --retry-delay 2 \
+            "https://github.com/namecallfilter/tiktokmodcloud/releases/download/v46.4.3-mod-fix/46.4.3_universal_fix.apk" \
+            -o input/tiktok.apk
+
+          echo "88845094adb702e2b92ada1fec56920083208ff48db03a879621f3de8a14190c  input/tiktok.apk" \
+            | sha256sum -c -
+
+          sha256sum input/tiktok.apk > report/hash.txt
+
+      - name: Inspect APK identity and signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+
+          AAPT="$(find "$SDK/build-tools" -type f -name aapt | sort -V | tail -n1)"
+          APKSIGNER="$(find "$SDK/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+
+          "$AAPT" dump badging input/tiktok.apk \
+            > report/badging.txt
+
+          "$APKSIGNER" verify --print-certs --verbose input/tiktok.apk \
+            > report/signature.txt 2>&1
+
+      - name: Install JADX
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="$(
+            curl -fsSL https://api.github.com/repos/skylot/jadx/releases/latest |
+            jq -r '.assets[] |
+              select(.name | test("^jadx-[0-9.]+\\.zip$")) |
+              .browser_download_url' |
+            head -n1
+          )"
+
+          curl -fL "$URL" -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          chmod +x /tmp/jadx/bin/jadx
+          /tmp/jadx/bin/jadx --version > report/jadx-version.txt
+
+      - name: Decompile exact Share and post-model classes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p report/classes
+
+          inspect_class() {
+            CLASS="$1"
+            FILE="$2"
+
+            timeout 300s /tmp/jadx/bin/jadx \
+              --no-res \
+              --show-bad-code \
+              --single-class "$CLASS" \
+              --single-class-output "report/classes/$FILE" \
+              input/tiktok.apk \
+              > "report/classes/$FILE.log" 2>&1 || true
+          }
+
+          inspect_class \
+            "com.ss.android.ugc.aweme.feed.assem.share.VideoShareAssem" \
+            "VideoShareAssem.java"
+
+          inspect_class \
+            "com.ss.android.ugc.aweme.feed.assem.share.VideoShareViewModel" \
+            "VideoShareViewModel.java"
+
+          inspect_class \
+            "com.ss.android.ugc.aweme.feed.model.VideoItemParams" \
+            "VideoItemParams.java"
+
+          inspect_class \
+            "com.ss.android.ugc.aweme.feed.model.Aweme" \
+            "Aweme.java"
+
+          inspect_class \
+            "com.ss.android.ugc.aweme.feed.model.Video" \
+            "Video.java"
+
+      - name: Extract QuickDL hook evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "===== SHARE BUTTON ====="
+
+            grep -nE \
+              "class VideoShareAssem|onClick\\(|getAweme\\(|getAid\\(|setOnClickListener|setOnLongClickListener|right_container_share|video_share_button_long_click" \
+              report/classes/VideoShareAssem.java \
+              | head -n 500 || true
+
+            echo
+            echo "===== CURRENT POST ====="
+
+            grep -nE \
+              "getAweme\\(" \
+              report/classes/VideoItemParams.java \
+              | head -n 100 || true
+
+            echo
+            echo "===== AWEME ID / VIDEO ====="
+
+            grep -nE \
+              "getAid\\(|getAwemeId\\(|getVideo\\(" \
+              report/classes/Aweme.java \
+              | head -n 200 || true
+
+          } | tee report/hook-evidence.txt
+
+      - name: Extract full Share onClick context
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("report/classes/VideoShareAssem.java")
+          out = Path("report/share-onclick.txt")
+
+          if not p.exists():
+              out.write_text("VideoShareAssem was not produced.")
+              raise SystemExit()
+
+          lines = p.read_text(errors="replace").splitlines()
+
+          result = []
+
+          for i, line in enumerate(lines):
+              if "onClick(" in line:
+                  start = max(0, i - 30)
+                  end = min(len(lines), i + 350)
+
+                  result.extend(
+                      f"{n + 1:06d}: {lines[n]}"
+                      for n in range(start, end)
+                  )
+
+          out.write_text(
+              "\n".join(result)
+              if result
+              else "No onClick method found."
+          )
+          PY
+
+      - name: Scan existing mod hooks
+        shell: bash
+        run: |
+          mkdir -p /tmp/dex
+
+          unzip -q -j input/tiktok.apk 'classes*.dex' -d /tmp/dex || true
+
+          find /tmp/dex -name '*.dex' -print0 \
+            | xargs -0 strings 2>/dev/null \
+            | grep -Eai \
+              'TikTokModCloud|tiktokplugin|xposed|lsposed|lspatch|morphe|frida|zygisk|DownloadViaTikTokSSL|jiagu' \
+            | sort -u \
+            > report/mod-hooks.txt || true
+
+      - name: Print results
+        if: always()
+        shell: bash
+        run: |
+          echo "===== APK ====="
+          head -n 20 report/badging.txt || true
+
+          echo
+          echo "===== SIGNATURE ====="
+          cat report/signature.txt || true
+
+          echo
+          echo "===== QUICKDL HOOK ====="
+          cat report/hook-evidence.txt || true
+
+          echo
+          echo "===== EXISTING MOD HOOKS ====="
+          head -n 300 report/mod-hooks.txt || true
+
+      - name: Upload inspection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickDL-TikTok-46.4.3-Inspection
+          path: report/
+          retention-days: 7
